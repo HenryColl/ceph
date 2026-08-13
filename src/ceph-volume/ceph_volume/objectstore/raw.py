@@ -1,6 +1,7 @@
 import logging
 import json
 import os
+import secrets as _secrets
 from .baseobjectstore import BaseObjectStore
 from ceph_volume import terminal, decorators, conf, process
 from ceph_volume.util import system, disk
@@ -62,6 +63,29 @@ class Raw(BaseObjectStore):
                 self.__dict__[f'{device_type}_device_path'] = \
                     '/dev/mapper/{}'.format(mapping)  # TODO(guits): need to preserve path or find a way to get the parent device from the mapper ?
 
+    def prepare_sed(self) -> None:
+        """
+        Provision each device with SED/OPAL encryption via sedutil-cli.
+
+        1. Generate a random 32-byte Admin1 key (hex-encoded).
+        2. Record it in self.secrets['sed_key'] so create_id() stores it
+            in the monitor under dm-crypt/osd/<fsid>/sed 
+        3. For every present device role (block, db, wal):
+          a. Format the drive: pre-flight locking check, WKK takeOwnership,
+             enableLockingRange, setAdmin1Pwd. This leaves the drtive unlocked
+
+        Device paths are NOT updated — there is no mapper device; BlueStore
+        uses the raw device path directly.
+        """
+        admin1_key = _secrets.token_hex(32)
+        self.secrets['sed_key'] = admin1_key
+        for device, _device_type in [(self.block_device_path, 'block'),
+                                     (self.db_device_path, 'db'),
+                                     (self.wal_device_path, 'wal')]:
+            if not device:
+                continue
+            encryption_utils.sed_format(admin1_key, device)
+
     def safe_prepare(self,
                      args: Optional["argparse.Namespace"] = None) -> None:
         """
@@ -104,6 +128,8 @@ class Raw(BaseObjectStore):
         if self.precondition_block_device():
             self.skip_mkfs_discard = True
 
+        if self.sed:
+            self.prepare_sed()
         if self.encrypted:
             self.prepare_dmcrypt()
 
@@ -122,6 +148,17 @@ class Raw(BaseObjectStore):
         return nvme_utils.preformat(self.block_device_path)
 
     def _activate(self) -> None:
+        if self.sed:
+            # SED/OPAL path: unlock each present device with the stored
+            # Admin1 key.  No mapper device is created; raw paths are used.
+            admin1_key = encryption_utils.get_sed_key(self.osd_id,
+                                                      self.osd_fsid)
+            for device in filter(None, [self.block_device_path,
+                                        self.db_device_path,
+                                        self.wal_device_path]):
+                encryption_utils.sed_open(admin1_key, device)
+            # device paths remain unchanged — fall through to mount/link steps
+
         mappers: Optional[RawOsdCryptMappers] = None
         if RawOsdCryptMappers.backing_device_path(self.block_device_path):
             mappers = RawOsdCryptMappers(

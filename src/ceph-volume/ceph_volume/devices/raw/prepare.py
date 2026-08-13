@@ -1,6 +1,7 @@
 from __future__ import print_function
 import logging
 import os
+import shutil
 from textwrap import dedent
 from ceph_volume import terminal, objectstore
 from .common import create_parser
@@ -42,6 +43,15 @@ class Prepare(object):
         self.args = parser.parse_args(self.argv)
         if self.args.bluestore:
             self.args.objectstore = 'bluestore'
+        if self.args.sed and self.args.dmcrypt:
+            terminal.error('--SED and --dmcrypt are mutually exclusive')
+            raise SystemExit(1)
+
+        if self.args.sed and not shutil.which('sedutil-cli'):
+            terminal.error('--SED requires sedutil-cli to be installed '
+                           '(available via EPEL)')
+            raise SystemExit(1)
+
         if self.args.dmcrypt:
             if not self.args.with_tpm and not os.getenv('CEPH_VOLUME_DMCRYPT_SECRET'):
                 terminal.error('encryption was requested (--dmcrypt) but environment variable ' \

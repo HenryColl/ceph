@@ -46,6 +46,7 @@ class BaseObjectStore:
         self.wal_device_path: str = ''
         self.db_device_path: str = ''
         self.block_lv: Optional[Volume] = None
+        self.sed: int = int(getattr(self.args, 'sed', False))
         if getattr(self.args, 'dmcrypt', False):
             self.encrypted = 1
             if not self.with_tpm:

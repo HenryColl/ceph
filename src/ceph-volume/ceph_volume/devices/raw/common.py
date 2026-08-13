@@ -59,6 +59,14 @@ def create_parser(prog: str, description: str) -> argparse.ArgumentParser:
         help='Enable device encryption via dm-crypt',
     )
     parser.add_argument(
+        '--SED',
+        dest='sed',
+        action='store_true',
+        default=False,
+        help='Use SED/OPAL hardware encryption managed by sedutil-cli. '
+             'Mutually exclusive with --dmcrypt.',
+    )
+    parser.add_argument(
         '--with-tpm',
         dest='with_tpm',
         help='Whether encrypted OSDs should be enrolled with TPM.',

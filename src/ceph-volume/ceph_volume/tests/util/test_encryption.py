@@ -4,6 +4,7 @@ from typing import Any
 import base64
 import pytest
 import json
+import re
 
 
 class TestNoWorkqueue:
@@ -390,3 +391,93 @@ class TestCephLuks2:
     @patch.object(encryption.CephLuks2, 'get_json_area', Mock(return_value={"whatever": "fake-value"}))
     def test_is_tpm2_enrolled_false_not_enrolled_with_tpm2(self) -> None:
         assert not encryption.CephLuks2('/dev/foo').is_tpm2_enrolled
+
+
+class TestSedFormat:
+    """Tests for encryption.sed_format()"""
+
+    def _make_call(self, rc=0, out=None):
+        """Return a process.call mock that always returns (out or [], [], rc)."""
+        return Mock(return_value=(out or [], [], rc))
+
+    @patch('ceph_volume.util.encryption._sed_query_locking_enabled', return_value=False)
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_clean_drive_does_not_revert(self, m_call, m_query):
+        """A drive with locking not yet enabled skips the WKK revert step."""
+        m_call.return_value = ([], [], 0)
+        encryption.sed_format('admin1secret', '/dev/sda')
+        # No --revertTPer call should be present
+        calls_flat = [' '.join(c[0][0]) for c in m_call.call_args_list]
+        assert not any('revertTPer' in c for c in calls_flat)
+
+    @patch('ceph_volume.util.encryption._sed_query_locking_enabled', return_value=True)
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_clean_drive_provisioning(self, m_call, m_query):
+        """initialSetup → setAdmin1Password → enableLockingRange are called in order,
+        WKK is passed to --initialSetup, and admin1_key is forwarded to --setAdmin1Password."""
+        m_call.return_value = ([], [], 0)
+        encryption.sed_format('admin1secret', '/dev/sda')
+        calls = [c[0][0] for c in m_call.call_args_list]
+        subcommands = [cmd[1] for cmd in calls]
+        assert subcommands == ['--revertTPer', '--initialSetup', '--setAdmin1Password', '--enableLockingRange']
+        setup_call = next(cmd for cmd in calls if '--initialSetup' in cmd)
+        assert encryption.SED_WKK in setup_call
+        set_pw_call = next(cmd for cmd in calls if '--setAdmin1Password' in cmd)
+        assert 'admin1secret' in set_pw_call
+
+    @patch('ceph_volume.util.encryption._sed_query_locking_enabled', return_value=True)
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_already_locked_unknown_sid_raises(self, m_call, m_query):
+        """WKK revert fails (unknown SID) → RuntimeError; no further calls made."""
+        # revertTPer returns rc=1, everything else returns rc=0
+        def side_effect(cmd, **kwargs):
+            if '--revertTPer' in cmd:
+                return ([], ['auth failure'], 1)
+            return ([], [], 0)
+        m_call.side_effect = side_effect
+        with pytest.raises(RuntimeError, match=re.escape("sedutil-cli --revertTPer failed on /dev/sda: ['auth failure']")):
+            encryption.sed_format('admin1secret', '/dev/sda')
+        # Only the revertTPer call should have been made
+        subcommands = [c[0][0][1] for c in m_call.call_args_list]
+        assert '--initialSetup' not in subcommands
+
+    @patch('ceph_volume.util.encryption._sed_query_locking_enabled', return_value=False)
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_no_cryptsetup_calls(self, m_call, m_query):
+        """SED format must not invoke cryptsetup at all."""
+        m_call.return_value = ([], [], 0)
+        encryption.sed_format('admin1secret', '/dev/sda')
+        for c in m_call.call_args_list:
+            assert 'cryptsetup' not in c[0][0][0]
+
+
+class TestSedOpen:
+    """Tests for encryption.sed_open()"""
+
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_calls_setLockingRange_RW(self, m_call):
+        m_call.return_value = ([], [], 0)
+        encryption.sed_open('admin1secret', '/dev/sda')
+        args = m_call.call_args[0][0]
+        assert args[:5] == ['sedutil-cli', '--setLockingRange', '0', 'RW', 'admin1secret']
+        assert args[5] == '/dev/sda'
+
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_raises_on_failure(self, m_call):
+        m_call.return_value = ([], ['error'], 1)
+        with pytest.raises(RuntimeError, match='setLockingRange'):
+            encryption.sed_open('admin1secret', '/dev/sda')
+
+
+class TestSedQueryLockingEnabled:
+    """Tests for encryption._sed_query_locking_enabled()"""
+
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_returns_true_when_locking_enabled(self, m_call):
+        m_call.return_value = (['LockingEnabled = Y'], [], 0)
+        assert encryption._sed_query_locking_enabled('/dev/sda') is True
+
+    @patch('ceph_volume.util.encryption.process.call')
+    def test_returns_false_when_locking_not_enabled(self, m_call):
+        m_call.return_value = (['Locking function enabled = N'], [], 0)
+        assert encryption._sed_query_locking_enabled('/dev/sda') is False

@@ -300,3 +300,57 @@ class TestRaw:
             rawbluestore._activate.assert_called_once_with()
             assert rawbluestore.block_device_path == '/dev/mapper/ceph-db32a338-b640-4cbc-af17-f63808b1c36e-sdb-block-dmcrypt'
             assert rawbluestore.db_device_path == '/dev/mapper/ceph-db32a338-b640-4cbc-af17-f63808b1c36e-sdc-db-dmcrypt'
+
+
+class TestRawPrepareSed:
+    """Tests for Raw.prepare_sed() and _activate() SED branch."""
+
+    @patch('ceph_volume.objectstore.raw.prepare_utils.create_key',
+           Mock(return_value='AQCee6ZkzhOrJRAAZWSvNC3KdXOpC2w8ly4AZQ=='))
+    def setup_method(self, _):
+        self.raw = Raw([])
+
+    @patch('ceph_volume.objectstore.raw.encryption_utils.sed_open', Mock())
+    @patch('ceph_volume.objectstore.raw.encryption_utils.sed_format', Mock())
+    @patch('ceph_volume.objectstore.raw._secrets.token_hex', return_value='deadbeef' * 8)
+    def test_prepare_sed_calls_format(self, m_token):
+        self.raw.block_device_path = '/dev/foo0'
+        self.raw.db_device_path = '/dev/foo1'
+        self.raw.wal_device_path = '/dev/foo2'
+        self.raw.prepare_sed()
+        from ceph_volume.objectstore import raw as raw_mod
+        assert raw_mod.encryption_utils.sed_format.call_count == 3
+        raw_mod.encryption_utils.sed_format.assert_any_call('deadbeef' * 8, '/dev/foo0')
+        raw_mod.encryption_utils.sed_format.assert_any_call('deadbeef' * 8, '/dev/foo1')
+        raw_mod.encryption_utils.sed_format.assert_any_call('deadbeef' * 8, '/dev/foo2')
+
+
+    @patch('ceph_volume.objectstore.raw.encryption_utils.sed_open')
+    @patch('ceph_volume.objectstore.raw.encryption_utils.get_sed_key',
+           return_value='retrieved-admin1')
+    @patch('ceph_volume.objectstore.raw.RawOsdCryptMappers.backing_device_path',
+           return_value=None)
+    def test_activate_sed_calls_sed_open(self, m_backing, m_get_key, m_sed_open):
+        self.raw.sed = 1
+        self.raw.osd_id = '0'
+        self.raw.osd_fsid = 'fake-fsid'
+        self.raw.block_device_path = '/dev/foo0'
+        self.raw.db_device_path = '/dev/foo1'
+        self.raw.wal_device_path = ''
+        self.raw.osd_path = '/var/lib/ceph/osd/ceph-0'
+
+        with patch('ceph_volume.objectstore.raw.system.path_is_mounted', return_value=True), \
+             patch('ceph_volume.objectstore.raw.prepare_utils.create_osd_path'), \
+             patch('ceph_volume.objectstore.raw.Raw.unlink_bs_symlinks'), \
+             patch('ceph_volume.objectstore.raw.system.chown'), \
+             patch('ceph_volume.objectstore.raw.process.run'), \
+             patch('ceph_volume.objectstore.raw.prepare_utils.link_block'), \
+             patch('ceph_volume.objectstore.raw.prepare_utils.link_db'), \
+             patch('ceph_volume.objectstore.raw.prepare_utils.link_wal'), \
+             patch('ceph_volume.objectstore.raw.terminal.success'):
+            self.raw._activate()
+
+        m_get_key.assert_called_once_with('0', 'fake-fsid')
+        m_sed_open.assert_any_call('retrieved-admin1', '/dev/foo0')
+        m_sed_open.assert_any_call('retrieved-admin1', '/dev/foo1')
+        assert m_sed_open.call_count == 2

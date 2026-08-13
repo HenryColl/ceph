@@ -18,6 +18,12 @@ from .disk import (
 from packaging import version
 from typing import Any, Dict, List, Optional
 
+# Well-Known Key used as the SID credential on every SED/OPAL drive provisioned
+# by ceph-volume.  It enables automated RevertTPer resets without needing the
+# physical PSID label.  It is a *reset* capability only — data cannot be
+# recovered from the Admin1 password using this key alone.
+SED_WKK = 'ceph-sed-wkk-v1'
+
 logger = logging.getLogger(__name__)
 mlogger = terminal.MultiLogger(__name__)
 
@@ -276,6 +282,39 @@ def dmcrypt_close(mapping, skip_path_check=False):
     # don't be strict about the remove call, but still warn on the terminal if it fails
     process.run(['cryptsetup', 'remove', mapping], stop_on_error=False)
 
+def _get_monitor_key(osd_id: str, osd_fsid: str, config_key: str,
+                     lockbox_keyring: Optional[str] = None) -> str:
+    """Retrieve a key stored in the monitor's config-key store.
+
+    :param osd_id: the OSD integer ID
+    :param osd_fsid: the OSD FSID
+    :param config_key: the full config-key path (e.g. ``dm-crypt/osd/<fsid>/luks``)
+    :param lockbox_keyring: path to the lockbox keyring; defaults to the
+        standard location for this OSD
+    """
+    if lockbox_keyring is None:
+        lockbox_keyring = '/var/lib/ceph/osd/%s-%s/lockbox.keyring' % (conf.cluster, osd_id)
+    name = 'client.osd-lockbox.%s' % osd_fsid
+
+    mlogger.info(f'Running ceph config-key get {config_key}')
+    stdout, stderr, returncode = process.call(
+        [
+            'ceph',
+            '--cluster', conf.cluster,
+            '--name', name,
+            '--keyring', lockbox_keyring,
+            'config-key',
+            'get',
+            config_key,
+        ],
+        show_command=True,
+        logfile_verbose=False,
+    )
+    if returncode != 0:
+        raise RuntimeError(f'Unable to retrieve key {config_key}')
+    return ' '.join(stdout).strip()
+
+
 def get_dmcrypt_key(osd_id, osd_fsid, lockbox_keyring=None):
     """
     Retrieve the dmcrypt (secret) key stored initially on the monitor. The key
@@ -287,28 +326,25 @@ def get_dmcrypt_key(osd_id, osd_fsid, lockbox_keyring=None):
     To support scanning, it is optionally configurable to a custom location
     (e.g. inside a lockbox partition mounted in a temporary location)
     """
-    if lockbox_keyring is None:
-        lockbox_keyring = '/var/lib/ceph/osd/%s-%s/lockbox.keyring' % (conf.cluster, osd_id)
-    name = 'client.osd-lockbox.%s' % osd_fsid
-    config_key = 'dm-crypt/osd/%s/luks' % osd_fsid
-
-    mlogger.info(f'Running ceph config-key get {config_key}')
-    stdout, stderr, returncode = process.call(
-        [
-            'ceph',
-            '--cluster', conf.cluster,
-            '--name', name,
-            '--keyring', lockbox_keyring,
-            'config-key',
-            'get',
-            config_key
-        ],
-        show_command=True,
-        logfile_verbose=False
+    return _get_monitor_key(
+        osd_id, osd_fsid,
+        config_key='dm-crypt/osd/%s/luks' % osd_fsid,
+        lockbox_keyring=lockbox_keyring,
     )
-    if returncode != 0:
-        raise RuntimeError('Unable to retrieve dmcrypt secret')
-    return ' '.join(stdout).strip()
+
+
+def get_sed_key(osd_id: str, osd_fsid: str, lockbox_keyring: Optional[str] = None) -> str:
+    """Retrieve the SED Admin1 key stored in the monitor's config-key store.
+
+    The key is stored under ``dm-crypt/osd/<fsid>/sed``, which is the path
+    the monitor assigns when the JSON secrets dict contains a ``sed_key``
+    entry.
+    """
+    return _get_monitor_key(
+        osd_id, osd_fsid,
+        config_key='dm-crypt/osd/%s/sed' % osd_fsid,
+        lockbox_keyring=lockbox_keyring,
+    )
 
 
 def write_lockbox_keyring(osd_id, osd_fsid, secret):
@@ -454,6 +490,65 @@ def prepare_dmcrypt(key: str,
         options=open_options
     )
     return '/dev/mapper/%s' % mapping
+
+def _sed_call(cmd: List[str]) -> List[str]:
+    """Run a sedutil-cli sub-command and raise RuntimeError on failure.
+
+    :param cmd: full argument list starting with 'sedutil-cli'
+    """
+    _out, err, rc = process.call(cmd, show_command=True, terminal_verbose=True)
+    if rc != 0:
+        device = cmd[-1]
+        detail = f': {err}' if err else ''
+        raise RuntimeError(f'{" ".join(cmd[:2])} failed on {device}{detail}')
+    return _out
+
+def _sed_query_locking_enabled(device: str) -> bool:
+    """Return True if the drive's Locking SP is already enabled/setup."""
+    out = _sed_call(['sedutil-cli', '--query', device])
+    return 'LockingEnabled = Y' in '\n'.join(out)
+
+def sed_format(admin1_key: str, device: str) -> None:
+    """Provision a drive for SED/OPAL encryption using sedutil-cli.
+
+    Steps performed:
+      1. Query the drive's LockingEnabled status.
+      2. If locking is already enabled, attempt a revertTPer with the WKK to
+         return the drive to factory state.  Raises RuntimeError if the revert
+         fails (drive was provisioned with a different SID — manual PSID revert
+         required).
+      3. Run --initialSetup with the WKK: takes ownership and sets SID to WKK.
+      4. Set Admin1 to the caller-supplied per-drive random key.
+      5. Enable the global locking range (--enableLockingRange 0).
+
+    :param admin1_key: random per-drive secret used as the Admin1 credential
+    :param device: absolute path to the block device
+    """
+    if _sed_query_locking_enabled(device):
+        mlogger.info('SED locking already enabled on %s — attempting WKK revert', device)
+        _sed_call(['sedutil-cli', '--revertTPer', SED_WKK, device])
+        mlogger.info('WKK revert succeeded on %s — drive is back to factory state', device)
+
+    # initialSetup: takes ownership and sets SID to the WKK.
+    # TODO before PR Note: on some drives this call may fail spuriously — see
+    # https://github.com/Drive-Trust-Alliance/sedutil/issues/397, decide what to do
+    _sed_call(['sedutil-cli', '--initialSetup', SED_WKK, device])
+    _sed_call(['sedutil-cli', '--setAdmin1Password', SED_WKK, admin1_key, device])
+
+    # Enable the global locking range - full drive contents
+    _sed_call(['sedutil-cli', '--enableLockingRange', '0', SED_WKK, device])
+
+
+def sed_open(admin1_key: str, device: str) -> None:
+    """Unlock an OPAL global locking range using the Admin1 credential.
+
+    The device path is unchanged after this call — no mapper device is
+    created.  BlueStore uses the raw device path directly.
+
+    :param admin1_key: Admin1 credential stored in the monitor config-key
+    :param device: absolute path to the block device
+    """
+    _sed_call(['sedutil-cli', '--setLockingRange', '0', 'RW', admin1_key, device])
 
 
 class CephLuks2:
