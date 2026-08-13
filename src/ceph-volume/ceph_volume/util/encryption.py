@@ -551,6 +551,25 @@ def sed_open(admin1_key: str, device: str) -> None:
     _sed_call(['sedutil-cli', '--setLockingRange', '0', 'RW', admin1_key, device])
 
 
+def sed_revert(device: str) -> None:
+    """Revert an OPAL drive to factory state using the Well-Known Key.
+
+    Issues a RevertTPer command authenticated with the WKK that
+    ceph-volume uses during provisioning (``sed_format``).  This destroys
+    all OPAL state on the drive — locking ranges, credentials, and the
+    Locking SP itself — returning it to an unowned factory state.
+
+    Note, this always called, and will simply fail if the drive wasn't SED encyrpted
+    and provisioned by us
+
+    :param device: absolute path to the block device
+    """
+
+    _out, err, rc = process.call(['sedutil-cli --revertTPer', SED_WKK, device], show_command=True, terminal_verbose=True)
+    if rc == 0:
+        mlogger.info('SED revertTPer succeeded on %s — drive is back to factory state', device)
+
+
 class CephLuks2:
     def __init__(self, device: str) -> None:
         self.device: str = device

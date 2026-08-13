@@ -384,6 +384,11 @@ class Zap:
             self.zap_partition(Device('/dev/%s' % part_name))
 
         zap_device(device.path)
+
+        # Revert SED/OPAL state before wiping so the drive returns to
+        # factory state.  sed_revert() is a no-op locking wasn't configured by us
+        encryption.sed_revert(device.path)
+
         # TODO(guits): I leave this commented out, this should be part of a separate patch in order to
         # support device replacement with raw-based OSDs
         # if self.args.replace_block:

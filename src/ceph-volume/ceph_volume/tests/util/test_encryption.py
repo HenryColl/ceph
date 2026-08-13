@@ -481,3 +481,4 @@ class TestSedQueryLockingEnabled:
     def test_returns_false_when_locking_not_enabled(self, m_call):
         m_call.return_value = (['Locking function enabled = N'], [], 0)
         assert encryption._sed_query_locking_enabled('/dev/sda') is False
+        
