@@ -84,6 +84,13 @@ common_args: Dict[str, Any] = {
         'action': arg_validators.DmcryptAction,
         'help': 'Enable device encryption via dm-crypt',
     },
+    '--SED': {
+        'dest': 'sed',
+        'action': 'store_true',
+        'default': False,
+        'help': 'Use SED/OPAL hardware encryption managed by sedutil-cli. '
+                'Mutually exclusive with --dmcrypt.',
+    },
     '--dmcrypt-format-opts': {
         'default': None,
         'type': str,

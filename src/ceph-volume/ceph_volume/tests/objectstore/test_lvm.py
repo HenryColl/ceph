@@ -50,7 +50,8 @@ class TestLvm:
                                     'ceph.objectstore': 'seastore',
                                     'ceph.encrypted': True,
                                     'ceph.vdo': '0',
-                                    'ceph.with_tpm': 0}
+                                    'ceph.with_tpm': 0,
+                                    'ceph.sed': 0}
 
     @patch('ceph_volume.conf.cluster', 'ceph')
     @patch('ceph_volume.api.lvm.get_single_lv')
@@ -91,7 +92,8 @@ class TestLvm:
                                     'ceph.encrypted': True,
                                     'ceph.objectstore': 'seastore',
                                     'ceph.vdo': '0',
-                                    'ceph.with_tpm': 1}
+                                    'ceph.with_tpm': 1,
+                                    'ceph.sed': 0}
 
     @patch('ceph_volume.conf.cluster', 'ceph')
     @patch('ceph_volume.objectstore.lvm.prepare_utils.create_id', Mock(return_value='111'))
@@ -130,7 +132,8 @@ class TestLvm:
                                  'ceph.encrypted': True,
                                  'ceph.vdo': '0',
                                  'ceph.with_tpm': 0,
-                                 'ceph.objectstore': 'seastore'}
+                                 'ceph.objectstore': 'seastore',
+                                 'ceph.sed': 0}
 
     @patch('ceph_volume.util.disk.is_partition', Mock(return_value=True))
     @patch('ceph_volume.api.lvm.create_lv')
@@ -691,3 +694,129 @@ class TestLvm:
         with pytest.raises(RuntimeError) as error:
             self.lvm.activate()
         assert str(error.value) == 'could not find osd.1 with osd_fsid 824f7edf'
+
+
+class TestLvmPrepareSed:
+    """Tests for Lvm.prepare_sed() and the SED branch of _activate()."""
+
+    @patch('ceph_volume.objectstore.lvm.prepare_utils.create_key',
+           Mock(return_value='AQCee6ZkzhOrJRAAZWSvNC3KdXOpC2w8ly4AZQ=='))
+    def setup_method(self, _):
+        args = Namespace(dmcrypt_format_opts=None, dmcrypt_open_opts=None)
+        self.lvm = Lvm(args)
+
+    # ------------------------------------------------------------------
+    # pre_prepare: sed_key stored in secrets and ceph.sed tag both set
+    # ------------------------------------------------------------------
+
+    @patch('ceph_volume.objectstore.lvm._secrets.token_hex', return_value='deadbeef' * 8)
+    @patch('ceph_volume.conf.cluster', 'ceph')
+    @patch('ceph_volume.api.lvm.get_single_lv')
+    @patch('ceph_volume.objectstore.lvm.prepare_utils.create_id', Mock(return_value='0'))
+    def test_pre_prepare_sed(self, m_get_single_lv, m_token, factory):
+        m_get_single_lv.return_value = Volume(lv_name='lv_foo',
+                                              lv_path='/fake-path',
+                                              vg_name='vg_foo',
+                                              lv_tags='',
+                                              lv_uuid='fake-uuid')
+        self.lvm.sed = 1
+        self.lvm.args = factory(objectstore='bluestore',
+                                cluster_fsid='abcd',
+                                osd_fsid='abc123',
+                                crush_device_class='',
+                                osd_id=None,
+                                data='vg_foo/lv_foo')
+        self.lvm.pre_prepare()
+        assert self.lvm.secrets['sed_key'] == 'deadbeef' * 8
+        assert self.lvm.tags['ceph.sed'] == 1
+
+    # ------------------------------------------------------------------
+    # prepare_sed: present devices get sed_format; absent ones are skipped
+    # ------------------------------------------------------------------
+
+    @patch('ceph_volume.objectstore.lvm.encryption_utils.sed_format')
+    def test_prepare_sed(self, m_sed_format):
+        self.lvm.secrets['sed_key'] = 'test-admin1-key'
+        self.lvm.block_device_path = '/dev/vg/block'
+        self.lvm.db_device_path = ''          # absent — must not be formatted
+        self.lvm.wal_device_path = '/dev/vg/wal'
+        self.lvm.prepare_sed()
+        m_sed_format.assert_any_call('test-admin1-key', '/dev/vg/block')
+        m_sed_format.assert_any_call('test-admin1-key', '/dev/vg/wal')
+        assert not any(
+            call.args[1] == '' for call in m_sed_format.call_args_list
+        ), 'sed_format must not be called for an empty device path'
+        assert m_sed_format.call_count == 2
+
+    # ------------------------------------------------------------------
+    # _activate: SED unlock path
+    # ------------------------------------------------------------------
+
+    def _make_activate_env(self, monkeypatch, conf_ceph_stub, patch_udevdata,
+                           fake_run, fake_call, m_create_osd_path):
+        conf_ceph_stub('[global]\nfsid=asdf-lkjh')
+        monkeypatch.setattr(system, 'chown', lambda path: 0)
+        monkeypatch.setattr('ceph_volume.configuration.load', lambda: None)
+        monkeypatch.setattr('ceph_volume.util.system.path_is_mounted', lambda path: False)
+        m_create_osd_path.return_value = MagicMock()
+
+    @patch('ceph_volume.objectstore.lvm.encryption_utils.sed_open')
+    @patch('ceph_volume.objectstore.lvm.encryption_utils.get_sed_key',
+           return_value='retrieved-admin1')
+    @patch('ceph_volume.objectstore.lvm.prepare_utils.create_osd_path')
+    @patch('ceph_volume.terminal.success')
+    def test_activate_sed_calls_sed_open(
+            self, m_success, m_create_osd_path, m_get_key, m_sed_open,
+            monkeypatch, fake_run, fake_call, conf_ceph_stub, patch_udevdata):
+        """get_sed_key is called once; sed_open is called for each present LV."""
+        self._make_activate_env(monkeypatch, conf_ceph_stub, patch_udevdata,
+                                fake_run, fake_call, m_create_osd_path)
+        lvs = [
+            Volume(lv_name='lv_foo-block',
+                   lv_path='/fake-block-path',
+                   vg_name='vg_foo',
+                   lv_tags='ceph.type=block,ceph.block_uuid=fake-block-uuid,'
+                            'ceph.db_uuid=fake-db-uuid,'
+                            'ceph.osd_id=0,ceph.osd_fsid=abcd,ceph.cluster_name=ceph,'
+                            'ceph.encrypted=0,ceph.sed=1,ceph.cephx_lockbox_secret=',
+                   lv_uuid='fake-block-uuid'),
+            Volume(lv_name='lv_foo-db',
+                   lv_path='/fake-db-path',
+                   vg_name='vg_foo_db',
+                   lv_tags='ceph.type=db,ceph.db_uuid=fake-db-uuid,'
+                            'ceph.block_uuid=fake-block-uuid,'
+                            'ceph.osd_id=0,ceph.osd_fsid=abcd,ceph.cluster_name=ceph,'
+                            'ceph.encrypted=0,ceph.sed=1,ceph.cephx_lockbox_secret=',
+                   lv_uuid='fake-db-uuid'),
+        ]
+        self.lvm._activate(lvs)
+
+        m_get_key.assert_called_once_with('0', 'abcd')
+        m_sed_open.assert_any_call('retrieved-admin1', '/fake-block-path')
+        m_sed_open.assert_any_call('retrieved-admin1', '/fake-db-path')
+        assert m_sed_open.call_count == 2
+
+    @patch('ceph_volume.objectstore.lvm.encryption_utils.sed_open')
+    @patch('ceph_volume.objectstore.lvm.encryption_utils.get_sed_key',
+           return_value='retrieved-admin1')
+    @patch('ceph_volume.objectstore.lvm.prepare_utils.create_osd_path')
+    @patch('ceph_volume.terminal.success')
+    def test_activate_sed_not_called_when_not_sed(
+            self, m_success, m_create_osd_path, m_get_key, m_sed_open,
+            monkeypatch, fake_run, fake_call, conf_ceph_stub, patch_udevdata):
+        """Without ceph.sed=1 tag, get_sed_key and sed_open are never called."""
+        self._make_activate_env(monkeypatch, conf_ceph_stub, patch_udevdata,
+                                fake_run, fake_call, m_create_osd_path)
+        lvs = [
+            Volume(lv_name='lv_foo-block',
+                   lv_path='/fake-block-path',
+                   vg_name='vg_foo',
+                   lv_tags='ceph.type=block,ceph.block_uuid=fake-block-uuid,'
+                            'ceph.osd_id=0,ceph.osd_fsid=abcd,ceph.cluster_name=ceph,'
+                            'ceph.encrypted=0,ceph.sed=0,ceph.cephx_lockbox_secret=',
+                   lv_uuid='fake-block-uuid'),
+        ]
+        self.lvm._activate(lvs)
+
+        m_get_key.assert_not_called()
+        m_sed_open.assert_not_called()

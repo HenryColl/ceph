@@ -1,8 +1,10 @@
 from __future__ import print_function
 import logging
 import argparse
+import os
+import shutil
 from textwrap import dedent
-from ceph_volume import objectstore
+from ceph_volume import objectstore, terminal
 from .common import prepare_parser
 from typing import List, Optional
 
@@ -58,6 +60,15 @@ class Prepare(object):
             self.args = parser.parse_args(self.argv)
         if self.args.bluestore:
             self.args.objectstore = 'bluestore'
+        if self.args.sed and self.args.dmcrypt:
+            terminal.error('--SED and --dmcrypt are mutually exclusive')
+            raise SystemExit(1)
+
+        if self.args.sed and not shutil.which('sedutil-cli'):
+            terminal.error('--SED requires sedutil-cli to be installed '
+                           '(available via EPEL)')
+            raise SystemExit(1)
+
         self.objectstore = objectstore.mapping['LVM'][self.args.objectstore](args=self.args)
         if self.objectstore is not None:
             self.objectstore.safe_prepare()

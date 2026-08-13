@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import secrets as _secrets
 from ceph_volume import conf, terminal, decorators, configuration, process
 from ceph_volume.api import lvm as api
 from ceph_volume.util import prepare as prepare_utils
@@ -29,6 +30,9 @@ class Lvm(BaseObjectStore):
     def pre_prepare(self) -> None:
         if self.encrypted and not self.with_tpm:
             self.secrets['dmcrypt_key'] = self.dmcrypt_key
+
+        if self.sed:
+            self.secrets['sed_key'] = _secrets.token_hex(32)
 
         cluster_fsid = self.get_cluster_fsid()
 
@@ -66,6 +70,7 @@ class Lvm(BaseObjectStore):
         self.tags['ceph.cephx_lockbox_secret'] = self.cephx_lockbox_secret
         self.tags['ceph.encrypted'] = self.encrypted
         self.tags['ceph.with_tpm'] = 1 if self.with_tpm else 0
+        self.tags['ceph.sed'] = self.sed
         self.tags['ceph.vdo'] = api.is_vdo(self.block_lv.__dict__['lv_path'])
 
     def prepare_data_device(self,
@@ -145,16 +150,33 @@ class Lvm(BaseObjectStore):
         if self.block_lv is not None:
             self.block_lv.set_tags(self.tags)
 
-        # 3/ encryption-only operations
+        # 3/ SED-only operations
+        if self.sed:
+            self.prepare_sed()
+
+        # 4/ encryption-only operations
         if self.encrypted:
             self.prepare_dmcrypt()
 
-        # 4/ osd_prepare req
+        # 5/ osd_prepare req
         self.prepare_osd_req()
 
-        # 5/ bluestore mkfs
+        # 6/ bluestore mkfs
         # prepare the osd filesystem
         self.osd_mkfs()
+
+    def prepare_sed(self) -> None:
+        """Provision each LV with SED/OPAL encryption via sedutil-cli.
+
+        Uses the per-OSD Admin1 key already stored in ``self.secrets['sed_key']``
+        by ``pre_prepare()``.  Formats block, db, and wal devices (if present).
+        Device paths are NOT remapped — BlueStore uses the LV path directly.
+        """
+        admin1_key = self.secrets['sed_key']
+        for device in filter(None, [self.block_device_path,
+                                    self.db_device_path,
+                                    self.wal_device_path]):
+            encryption_utils.sed_format(admin1_key, device)
 
     def prepare_dmcrypt(self) -> None:
         # If encrypted, there is no need to create the lockbox keyring file
@@ -357,6 +379,7 @@ class Lvm(BaseObjectStore):
             raise RuntimeError('could not find a bluestore OSD to activate')
 
         is_encrypted = osd_block_lv.tags.get('ceph.encrypted', '0') == '1'
+        is_sed = osd_block_lv.tags.get('ceph.sed', '0') == '1'
         dmcrypt_secret = ''
         osd_id = osd_block_lv.tags['ceph.osd_id']
         conf.cluster = osd_block_lv.tags['ceph.cluster_name']
@@ -376,6 +399,15 @@ class Lvm(BaseObjectStore):
         # XXX This needs to be removed once ceph-bluestore-tool can deal with
         # symlinks that exist in the osd dir
         self.unlink_bs_symlinks()
+
+        # SED unlock: open all present devices before priming the OSD dir.
+        # No mapper device is created; raw LV paths are used throughout.
+        if is_sed:
+            admin1_key = encryption_utils.get_sed_key(osd_id, osd_fsid)
+            for device in filter(None, [osd_block_lv.__dict__['lv_path'],
+                                        self.get_osd_device_path(osd_lvs, 'db'),
+                                        self.get_osd_device_path(osd_lvs, 'wal')]):
+                encryption_utils.sed_open(admin1_key, device)
 
         # encryption is handled here, before priming the OSD dir
         if is_encrypted:
