@@ -22,6 +22,7 @@ rgw=0
 rbd=0
 all=1
 asroot=""
+rpms=()
 
 usage() {
     echo "usage: $SCRIPT [options]"
@@ -30,6 +31,7 @@ usage() {
     echo "  --push               push when done"
     echo "  --strip              strip binaries"
     echo "  --root-build         build image as root"
+    echo "  --rpm <file>         install an RPM file (may be repeated)"
     echo
     echo "  --py                 python components (python-common, mgr)"
     echo "  --dashboard          dashboard"
@@ -80,6 +82,10 @@ while [ -n "$1" ]; do
 	    rgw=1
 	    all=0
 	    ;;
+	--rpm)
+	    shift
+	    rpms+=("$1")
+	    ;;
 
 	*)
 	    echo "unrecognized option $1"
@@ -113,6 +119,15 @@ fi
 
 dockerfile="FROM $base"$'\n'
 
+if [ ${#rpms[@]} -gt 0 ]; then
+    mkdir -p $TMP/rpms
+    for rpm in "${rpms[@]}"; do
+        cp "$rpm" $TMP/rpms/
+    done
+    dockerfile+=$'ADD rpms /tmp/rpms\n'
+    dockerfile+=$'RUN rpm --install /tmp/rpms/* && rm -rf /tmp/rpms\n'
+fi
+
 if [ $py -eq 1 ] || [ $all -eq 1 ]; then
     pushd ../src/pybind/mgr > /dev/null
     find ./ -name "*.pyc" -exec rm -f {} \;
@@ -144,6 +159,14 @@ if [ $py -eq 1 ] || [ $all -eq 1 ]; then
     [ $strip -eq 1 ] && strip $TMP/cythonlib/*
     popd > /dev/null
     dockerfile+=$'ADD cythonlib tmp_python_common\n'
+    dockerfile+=$'RUN for i in tmp_python_common/*; do find /usr/lib/python*/site-packages -type d -name $(basename $i) -exec cp -frpv $i/* \'{}\' \;; done && rm -rf tmp_python_common\n'
+
+    # ceph-volume
+    pushd ../src/ceph-volume > /dev/null
+    find ./ -name "*.pyc" -exec rm -f {} \;
+    tar --exclude=tests --exclude=.tox --exclude-backups -cf $TMP/ceph_volume.tar ceph_volume
+    popd > /dev/null
+    dockerfile+=$'ADD ceph_volume.tar tmp_python_common\n'
     dockerfile+=$'RUN for i in tmp_python_common/*; do find /usr/lib/python*/site-packages -type d -name $(basename $i) -exec cp -frpv $i/* \'{}\' \;; done && rm -rf tmp_python_common\n'
 
     # cephadm
