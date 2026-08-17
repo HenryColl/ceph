@@ -721,3 +721,34 @@ def test_drive_group_osd_type_crimson_roundtrip():
     assert spec2.osd_type == 'crimson'
     j2 = spec2.to_json()
     assert j2['spec']['osd_type'] == 'crimson'
+
+
+def test_ceph_volume_command_sed_lvm():
+    """SED flag is translated to --SED for lvm batch commands."""
+    spec = DriveGroupSpec(placement=PlacementSpec(host_pattern='*'),
+                          service_id='foobar',
+                          data_devices=DeviceSelection(all=True),
+                          sed=True,
+                          )
+    spec.validate()
+    inventory = _mk_inventory(_mk_device() * 2)
+    sel = drive_selection.DriveSelection(spec, inventory)
+    cmds = translate.to_ceph_volume(sel, []).run()
+    assert all(cmd == 'lvm batch --no-auto /dev/sda /dev/sdb --objectstore bluestore --SED --yes --no-systemd'
+               for cmd in cmds), f'Unexpected cmds: {cmds}'
+
+
+def test_ceph_volume_command_sed_raw():
+    """SED flag is translated to --SED for raw prepare commands."""
+    spec = DriveGroupSpec(placement=PlacementSpec(host_pattern='*'),
+                          service_id='foobar',
+                          data_devices=DeviceSelection(rotational=True),
+                          method='raw',
+                          sed=True,
+                          )
+    spec.validate()
+    inventory = _mk_inventory(_mk_device(rotational=True) * 2)
+    sel = drive_selection.DriveSelection(spec, inventory)
+    cmds = translate.to_ceph_volume(sel, []).run()
+    assert cmds[0] == 'raw prepare --bluestore --data /dev/sda --SED'
+    assert cmds[1] == 'raw prepare --bluestore --data /dev/sdb --SED'

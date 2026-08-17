@@ -149,6 +149,9 @@ class to_ceph_volume(object):
             if self.spec.tpm2:
                 cmds[i] += " --with-tpm"
 
+            if self.spec.sed:
+                cmds[i] += " --SED"
+
             if self.spec.osds_per_device:
                 cmds[i] += " --osds-per-device {}".format(self.spec.osds_per_device)
 
